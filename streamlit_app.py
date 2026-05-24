@@ -46,6 +46,9 @@ if "recording" not in st.session_state:
     st.session_state.model_loaded = False
     st.session_state.model = None
     st.session_state.sample_rate = 16000
+    st.session_state.recording_thread = None
+    st.session_state.recording_start_time = None
+    st.session_state.device_index = None  # Add this line
 
 # Get available devices - keep only Speaker and Microphone
 def get_working_devices():
@@ -65,15 +68,63 @@ def get_working_devices():
                 devices_list.append((i, f"🔊 Speaker - {d['name']}"))
                 speaker_added = True
             
-            # Add first working Microphone (only once)
-            elif ('microphone' in name or 'mic' in name) and not mic_added and 'array' in name:
-                devices_list.append((i, f"🎤 Microphone - {d['name']}"))
-                mic_added = True
+            # Add first working Microphone - prefer ones with 'array', but fallback to any mic
+            elif ('microphone' in name or 'mic' in name) and not mic_added:
+                # Prefer devices with 'array' or 'smart' in the name
+                if 'array' in name or 'smart' in name or 'mapper' in name:
+                    devices_list.append((i, f"🎤 Microphone - {d['name']}"))
+                    mic_added = True
     
     return devices_list if devices_list else []
 
 working_devices = get_working_devices()
 device_options = [dev[1] for dev in working_devices]
+
+# Function to record audio in background thread
+def record_audio_background(device_index):
+    """Record audio in background using threading"""
+    import sys
+    
+    print(f"[RECORD] Starting recording on device {device_index}", file=sys.stderr)
+    
+    try:
+        SAMPLE_RATE = 16000
+        CHANNELS = 1
+        CHUNK_SIZE = 8000  # 0.5 seconds at 16kHz
+        
+        audio_chunks = []
+        chunk_count = 0
+        
+        # Record chunks while recording flag is True
+        while st.session_state.recording:
+            try:
+                print(f"[RECORD] Recording chunk {chunk_count}...", file=sys.stderr)
+                chunk = sd.rec(CHUNK_SIZE, samplerate=SAMPLE_RATE, channels=CHANNELS,
+                             device=device_index, dtype=np.int16, blocksize=0)
+                sd.wait()
+                audio_chunks.append(chunk)
+                chunk_count += 1
+                print(f"[RECORD] Chunk {chunk_count} captured: {len(chunk)} samples", file=sys.stderr)
+            except Exception as e:
+                print(f"[RECORD] Error recording chunk: {e}", file=sys.stderr)
+                break
+        
+        # Combine all chunks into one array
+        print(f"[RECORD] Recording stopped. Total chunks: {len(audio_chunks)}", file=sys.stderr)
+        
+        if audio_chunks and len(audio_chunks) > 0:
+            combined_audio = np.concatenate(audio_chunks)
+            print(f"[RECORD] Combined audio: {len(combined_audio)} samples", file=sys.stderr)
+            st.session_state.audio_data = combined_audio
+            st.session_state.sample_rate = SAMPLE_RATE
+            print(f"[RECORD] Audio saved to session state", file=sys.stderr)
+        else:
+            print(f"[RECORD] No audio chunks captured!", file=sys.stderr)
+            st.session_state.audio_data = None
+            
+    except Exception as e:
+        print(f"[RECORD] Exception: {e}", file=sys.stderr)
+        st.session_state.audio_data = None
 
 # Function to get device's supported sample rate
 def get_device_sample_rate(device_index):
@@ -103,14 +154,16 @@ with col1:
             index=0
         )
         # Find the device index from working_devices
-        device_index = None
         for dev_id, dev_name in working_devices:
             if dev_name == selected_device:
-                device_index = dev_id
+                st.session_state.device_index = dev_id
                 break
+        
+        # DEBUG: Show selected device
+        st.caption(f"Using Device {st.session_state.device_index}: {selected_device}")
     else:
         st.error("❌ No working input devices found!")
-        device_index = None
+        st.session_state.device_index = None
     
     # Get available cached models
     cached_models = get_cached_models()
@@ -133,6 +186,22 @@ with col1:
         "large-v3": "~60+ sec"
     }
     st.caption(f"⏱️ Load time: {load_times[model_size]}")
+    
+    # Test microphone button
+    if st.button("🔧 Test Microphone", key="test_mic_btn", use_container_width=True):
+        if st.session_state.device_index is not None:
+            st.info("Testing microphone... please wait 1 second...")
+            try:
+                test_audio = sd.rec(16000, samplerate=16000, channels=1, 
+                                   device=st.session_state.device_index, dtype=np.int16, blocksize=0)
+                sd.wait()
+                max_level = np.max(np.abs(test_audio))
+                if max_level > 0:
+                    st.success(f"Microphone works! (Level: {max_level})")
+                else:
+                    st.warning(f"No sound detected (Level: 0)")
+            except Exception as e:
+                st.error(f"Error: {e}")
 
 with col2:
     st.subheader("📊 Status")
@@ -147,84 +216,50 @@ with col2:
 st.subheader("🔴 Recording Controls")
 
 col1, col2, col3 = st.columns(3)
+timer_placeholder = st.empty()  # For recording timer
 
 with col1:
     if st.button("🔴 Start Recording", key="record_btn", use_container_width=True):
-        if device_index is None:
-            status_placeholder.error("❌ No input device selected!")
+        if st.session_state.device_index is None:
+            status_placeholder.error("No input device selected!")
         else:
+            # Reset audio
+            st.session_state.audio_data = None
             st.session_state.recording = True
             st.session_state.recording_start_time = None
             
-            try:
-                # Unlimited recording with very large buffer
-                max_samples = 16000 * 3600  # ~1 hour at 16kHz (will adapt to actual sample rate)
-                
-                audio_data = None
-                recorded_rate = 16000
-                
-                # Try different sample rates and settings
-                sample_rates = [16000, 8000, 32000, 44100]
-                dtypes = [np.int16, np.float32]
-                channels_list = [1, 2]
-                
-                for rate in sample_rates:
-                    if audio_data is not None:
-                        break
-                    for dtype in dtypes:
-                        if audio_data is not None:
-                            break
-                        for ch in channels_list:
-                            try:
-                                # Record with very large duration (until user stops)
-                                import time
-                                audio_list = []
-                                start_time = time.time()
-                                
-                                # Record in chunks so UI can respond
-                                chunk_duration = 0.5  # 500ms chunks
-                                chunk_size = int(rate * chunk_duration)
-                                
-                                while st.session_state.recording:
-                                    chunk = sd.rec(chunk_size, samplerate=rate, channels=ch, device=device_index, dtype=dtype, blocksize=0)
-                                    sd.wait()
-                                    audio_list.append(chunk)
-                                    
-                                    # Update timer
-                                    elapsed = time.time() - start_time
-                                    mins = int(elapsed // 60)
-                                    secs = int(elapsed % 60)
-                                    status_placeholder.info(f"🔴 Recording... {mins}m {secs}s")
-                                
-                                if audio_list:
-                                    audio_data = np.concatenate(audio_list)
-                                    recorded_rate = rate
-                                
-                                break
-                            except:
-                                continue
-                
-                if audio_data is not None and len(audio_data) > 0:
-                    st.session_state.audio_data = audio_data
-                    st.session_state.sample_rate = recorded_rate
-                    st.session_state.recording = False
-                    
-                    elapsed = time.time() - start_time
-                    mins = int(elapsed // 60)
-                    secs = int(elapsed % 60)
-                    status_placeholder.success(f"✅ Recording complete! {mins}m {secs}s ({recorded_rate} Hz)")
-                else:
-                    st.session_state.recording = False
-                    status_placeholder.error("❌ Device doesn't support recording - try a different device")
-                    
-            except Exception as e:
-                status_placeholder.error(f"❌ Error recording: {str(e)}")
-                st.session_state.recording = False
+            print(f"\n[START] User clicked Start Recording with device {st.session_state.device_index}", file=__import__('sys').stderr)
+            
+            # Start recording in background thread
+            thread = threading.Thread(target=record_audio_background, args=(st.session_state.device_index,), daemon=True)
+            st.session_state.recording_thread = thread
+            thread.start()
+            
+            print(f"[START] Recording thread started", file=__import__('sys').stderr)
+            
+            status_placeholder.info("Recording... Speak now!")
 
 with col2:
     if st.button("⏹️ Stop Recording", key="stop_btn", use_container_width=True):
-        st.session_state.recording = False
-        status_placeholder.warning("Recording stopped")
+        if st.session_state.recording:
+            print(f"\n[STOP] User clicked Stop Recording", file=__import__('sys').stderr)
+            st.session_state.recording = False
+            print(f"[STOP] Recording flag set to False", file=__import__('sys').stderr)
+            
+            # Wait for thread to finish
+            if st.session_state.recording_thread:
+                print(f"[STOP] Waiting for thread to finish...", file=__import__('sys').stderr)
+                st.session_state.recording_thread.join(timeout=3)
+                print(f"[STOP] Thread finished", file=__import__('sys').stderr)
+            
+            # Show result
+            if st.session_state.audio_data is not None and len(st.session_state.audio_data) > 0:
+                samples = len(st.session_state.audio_data)
+                st.success(f"Recording complete! ({samples} samples)")
+            else:
+                st.error("No audio captured - try again")
+        else:
+            st.info("No recording in progress")
 
 with col3:
     if st.button("🗑️ Clear Recording", key="clear_btn", use_container_width=True):
@@ -232,8 +267,31 @@ with col3:
         st.session_state.recording = False
         status_placeholder.info("Recording cleared")
 
-# Audio Playback
+# Show recording timer while recording
+if st.session_state.recording:
+    import time
+    if st.session_state.recording_start_time is None:
+        st.session_state.recording_start_time = time.time()
+    
+    elapsed = time.time() - st.session_state.recording_start_time
+    mins = int(elapsed // 60)
+    secs = int(elapsed % 60)
+    timer_placeholder.info(f"⏱️ **Recording: {mins}m {secs}s**")
+    st.rerun()
+
+# Check if we have audio data
+has_audio = False
 if st.session_state.audio_data is not None:
+    try:
+        has_audio = len(st.session_state.audio_data) > 0
+    except:
+        has_audio = False
+
+if not has_audio:
+    st.warning("⏳ No audio recorded yet. Click 'Start Recording' to begin.")
+
+# Audio Playback
+if has_audio:
     st.subheader("🔊 Playback")
     
     # Convert audio to bytes for playback
@@ -250,7 +308,7 @@ if st.session_state.audio_data is not None:
     st.audio(audio_buffer, format="audio/wav", sample_rate=st.session_state.sample_rate)
 
 # Transcription
-if st.session_state.audio_data is not None:
+if has_audio:
     st.subheader("📝 Transcription")
     
     if st.button("🚀 Transcribe Audio", use_container_width=True):
